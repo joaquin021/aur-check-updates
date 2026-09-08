@@ -23,7 +23,8 @@ AUR_GIT="https://aur.archlinux.org"
 CHUNK=100          # packages per request (the AUR caps args per query at ~200)
 TIMEOUT=20
 
-# Where the guide suggests keeping build trees. Override with the environment.
+# Where the guide suggests keeping build trees. XDG_CACHE_HOME is usually unset
+# — the spec says to fall back to ~/.cache then, which is what most systems use.
 BUILD_DIR="${AURCHECK_BUILD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/aurcheck}"
 
 quiet=0
@@ -54,8 +55,10 @@ usage() {
 		  -V, --version     show version
 
 		ENVIRONMENT
-		  AURCHECK_BUILD_DIR   directory the update guide suggests building in
-		                       (default: \$XDG_CACHE_HOME/aurcheck)
+		  AURCHECK_BUILD_DIR   directory the update guide suggests building in.
+		                       Defaults to ~/.cache/aurcheck, or
+		                       \$XDG_CACHE_HOME/aurcheck if that variable is set.
+		                       Currently: $BUILD_DIR
 
 		EXIT CODES
 		  0  nothing to update / command succeeded

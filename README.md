@@ -106,11 +106,18 @@ curl -fsSL https://raw.githubusercontent.com/joaquin021/aur-check-updates/main/a
 
 ### From a clone
 
+Works regardless of whether the repository is public, and gives you `git pull`
+as the update path:
+
 ```bash
-git clone https://github.com/joaquin021/aur-check-updates.git
+git clone git@github.com:joaquin021/aur-check-updates.git
 cd aur-check-updates
 install -Dm755 aurcheck ~/.local/bin/aurcheck
 ```
+
+> The `curl` methods above download over anonymous HTTPS, so they only work
+> while the repository is public. A private repository answers them with
+> `404`; use this clone method, or `gh repo clone`, instead.
 
 ### Update or uninstall
 
@@ -196,11 +203,30 @@ The guide adapts to what it finds:
 Run `aurcheck update` with no arguments to get a guide for every package that is
 currently behind.
 
-Set `AURCHECK_BUILD_DIR` to change the directory the guide suggests building in:
+#### Where it suggests building
+
+By default the guide points at `~/.cache/aurcheck/<pkgbase>` — the same
+convention `paru` and `yay` use for their clones. If `XDG_CACHE_HOME` is set in
+your environment it is honoured instead, but it is unset on most systems and
+that is fine; `~/.cache` is exactly the fallback the XDG spec prescribes.
+
+Keeping the checkout around is what lets the next update show you a diff instead
+of the whole PKGBUILD. Nothing breaks if a cache cleaner deletes it — you just
+get the `git clone` form of the guide again.
+
+To build somewhere else, set `AURCHECK_BUILD_DIR`:
 
 ```bash
 AURCHECK_BUILD_DIR=~/src/aur aurcheck update brave-bin
 ```
+
+Or make it permanent in your `~/.bashrc`:
+
+```bash
+export AURCHECK_BUILD_DIR="$HOME/src/aur"
+```
+
+`aurcheck --help` prints the path currently in effect.
 
 ## Checking automatically
 
