@@ -140,8 +140,13 @@ aurcheck list                 list installed foreign packages, one per line
   -v, --verbose   also list packages that are already up to date
       --no-color  disable colors (also disabled automatically when piped)
   -h, --help      show help
-  -V, --version   show version
+      --version   show version
 ```
+
+There is deliberately no `-V` short flag. The usual Unix convention makes `-v`
+verbose and `-V` version, but two unrelated actions separated only by a shift
+key is a mistake waiting to happen, so `--version` is long-form only. Typing
+`-V` gets you a message pointing at the right one rather than the wrong output.
 
 ### Exit codes
 

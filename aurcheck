@@ -16,7 +16,7 @@
 
 set -uo pipefail
 
-VERSION=2.0.0
+VERSION=2.1.0
 AUR_RPC="https://aur.archlinux.org/rpc/v5/info"
 AUR_WEB="https://aur.archlinux.org/packages"
 AUR_GIT="https://aur.archlinux.org"
@@ -52,7 +52,8 @@ usage() {
 		  -v, --verbose     also list packages that are already up to date
 		      --no-color    disable colors (also disabled when not a terminal)
 		  -h, --help        show this help
-		  -V, --version     show version
+		      --version     show version (long form only, so it can never be
+		                    confused with -v)
 
 		ENVIRONMENT
 		  AURCHECK_BUILD_DIR   directory the update guide suggests building in.
@@ -376,7 +377,10 @@ main() {
 			-v|--verbose)  verbose=1 ;;
 			--no-color)    use_color=0 ;;
 			-h|--help)     setup_colors; usage; exit 0 ;;
-			-V|--version)  echo "aurcheck $VERSION"; exit 0 ;;
+			--version)     echo "aurcheck $VERSION"; exit 0 ;;
+			# -V is deliberately not an alias for --version: it sits one shift
+			# key away from -v (verbose) and the two do unrelated things.
+			-V)            die "-V is not a flag; use --version (or -v for verbose)" ;;
 			-*)            die "unknown option: $1 (try --help)" ;;
 			check|update|list)
 				[ -z "$subcmd" ] || rest+=("$1")
