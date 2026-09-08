@@ -1,0 +1,399 @@
+#!/usr/bin/env bash
+#
+# aurcheck — check whether the AUR packages installed on this system (the
+# "foreign" packages listed by `pacman -Qm`) have a newer version in the AUR,
+# and print a step-by-step guide for updating one by hand.
+#
+# READ-ONLY BY DESIGN. It never builds, installs, upgrades, or touches the
+# pacman database, and it never needs root. All it does is query the AUR RPC
+# over HTTPS and compare versions with vercmp. The `update` subcommand only
+# *prints* the commands you would run; it does not run them.
+#
+# Dependencies: bash, curl, jq, vercmp (pacman), git (only for the commands
+# the guide suggests you run yourself).
+#
+# Exit codes: 0 = up to date / success · 2 = updates available · 1 = error
+
+set -uo pipefail
+
+VERSION=2.0.0
+AUR_RPC="https://aur.archlinux.org/rpc/v5/info"
+AUR_WEB="https://aur.archlinux.org/packages"
+AUR_GIT="https://aur.archlinux.org"
+CHUNK=100          # packages per request (the AUR caps args per query at ~200)
+TIMEOUT=20
+
+# Where the guide suggests keeping build trees. Override with the environment.
+BUILD_DIR="${AURCHECK_BUILD_DIR:-${XDG_CACHE_HOME:-$HOME/.cache}/aurcheck}"
+
+quiet=0
+verbose=0
+use_color=1
+
+self="${0##*/}"
+
+die() { printf '%s: %s\n' "$self" "$*" >&2; exit 1; }
+
+usage() {
+	cat <<-EOF
+		aurcheck $VERSION — see which of your installed AUR packages have updates.
+
+		USAGE
+		  aurcheck [check]              list the installed AUR packages that have a
+		                               newer version in the AUR (default command)
+		  aurcheck update [package...]  print a step-by-step guide for updating by
+		                               hand; with no package, covers everything
+		                               that is out of date
+		  aurcheck list                 list installed foreign packages, one per line
+
+		OPTIONS
+		  -q, --quiet       only print lines for packages that have an update
+		  -v, --verbose     also list packages that are already up to date
+		      --no-color    disable colors (also disabled when not a terminal)
+		  -h, --help        show this help
+		  -V, --version     show version
+
+		ENVIRONMENT
+		  AURCHECK_BUILD_DIR   directory the update guide suggests building in
+		                       (default: \$XDG_CACHE_HOME/aurcheck)
+
+		EXIT CODES
+		  0  nothing to update / command succeeded
+		  2  updates are available
+		  1  error
+
+		aurcheck never installs or upgrades anything. \`update\` prints commands
+		for you to review and run yourself.
+	EOF
+}
+
+# ---------------------------------------------------------------- colors -----
+setup_colors() {
+	[ -t 1 ] || use_color=0
+	if [ "$use_color" = 1 ]; then
+		C_RESET=$'\033[0m'; C_BOLD=$'\033[1m'; C_DIM=$'\033[2m'
+		C_GREEN=$'\033[32m'; C_YELLOW=$'\033[33m'; C_RED=$'\033[31m'
+		C_BLUE=$'\033[36m'; C_MAGENTA=$'\033[35m'
+	else
+		C_RESET=; C_BOLD=; C_DIM=; C_GREEN=; C_YELLOW=; C_RED=
+		C_BLUE=; C_MAGENTA=
+	fi
+}
+
+header() { [ "$quiet" = 1 ] || printf '%s%s%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+note()   { [ "$quiet" = 1 ] || printf '  %s%s%s\n' "$C_DIM" "$1" "$C_RESET"; }
+cmd()    { printf '    %s%s%s\n' "$C_GREEN" "$1" "$C_RESET"; }
+comment(){ printf '    %s%s%s\n' "$C_DIM" "$1" "$C_RESET"; }
+step()   { printf '\n  %s%s%s\n' "$C_BOLD" "$1" "$C_RESET"; }
+
+# ------------------------------------------------------------- AUR query -----
+# Reads package names on stdin (one per line), prints TSV to stdout:
+#   Name <TAB> Version <TAB> PackageBase <TAB> OutOfDate <TAB> Maintainer
+aur_info() {
+	local -a names=()
+	local n
+	while read -r n; do [ -n "$n" ] && names+=("$n"); done
+	[ ${#names[@]} -gt 0 ] || return 0
+
+	local i body
+	for ((i = 0; i < ${#names[@]}; i += CHUNK)); do
+		local -a args=()
+		for n in "${names[@]:i:CHUNK}"; do args+=(--data-urlencode "arg[]=$n"); done
+
+		if ! body=$(curl -sfG --max-time "$TIMEOUT" --retry 2 --retry-delay 1 \
+		                  -H 'Accept: application/json' \
+		                  "${args[@]}" "$AUR_RPC"); then
+			return 1
+		fi
+		printf '%s' "$body" | jq -r '
+			.results[]? | [
+				.Name,
+				.Version,
+				(.PackageBase // .Name),
+				(.OutOfDate // 0 | tostring),
+				(.Maintainer // "")
+			] | @tsv'
+	done
+}
+
+# Installed foreign packages as "name version" lines.
+foreign_packages() {
+	command -v pacman >/dev/null || die "pacman not found — is this an Arch system?"
+	pacman -Qm 2>/dev/null
+}
+
+# Look up one TSV row by package name in the blob passed as $2.
+lookup() { printf '%s\n' "$2" | awk -F'\t' -v n="$1" '$1 == n {print; exit}'; }
+
+# Extra warnings worth showing next to a package.
+pkg_flags() {
+	local name="$1" ood="$2" maint="$3" out=""
+	[ "$ood" != "0" ] && out="$out ${C_RED}[flagged out-of-date]${C_RESET}"
+	[ -z "$maint" ]   && out="$out ${C_YELLOW}[orphaned]${C_RESET}"
+	case $name in
+		*-git|*-svn|*-hg|*-bzr)
+			out="$out ${C_DIM}[VCS package: the AUR version is not a reliable signal]${C_RESET}" ;;
+	esac
+	printf '%s' "$out"
+}
+
+# ------------------------------------------------------------ cmd: check -----
+cmd_check() {
+	local -a names=() versions=()
+	local n v
+	while read -r n v; do
+		[ -n "$n" ] || continue
+		names+=("$n"); versions+=("$v")
+	done < <(foreign_packages)
+
+	if [ ${#names[@]} -eq 0 ]; then
+		header "AUR"; note "no foreign packages installed"
+		return 0
+	fi
+
+	header "AUR (${#names[@]} foreign packages)"
+
+	local remote
+	if ! remote=$(printf '%s\n' "${names[@]}" | aur_info); then
+		printf '  %serror%s querying the AUR (no network?)\n' "$C_RED" "$C_RESET" >&2
+		return 1
+	fi
+
+	local updates=0 idx
+	for idx in "${!names[@]}"; do
+		local name="${names[$idx]}" local_v="${versions[$idx]}"
+		local line remote_v base ood maint flags
+		line=$(lookup "$name" "$remote")
+
+		if [ -z "$line" ]; then
+			[ "$quiet" = 1 ] && continue
+			printf '  %s?%s %-28s %-22s %snot in the AUR (built locally?)%s\n' \
+				"$C_DIM" "$C_RESET" "$name" "$local_v" "$C_DIM" "$C_RESET"
+			continue
+		fi
+
+		IFS=$'\t' read -r _ remote_v base ood maint <<<"$line"
+		flags=$(pkg_flags "$name" "$ood" "$maint")
+
+		if [ "$(vercmp "$local_v" "$remote_v")" -lt 0 ]; then
+			updates=$((updates + 1))
+			printf '  %s↑%s %-28s %s → %s%s%s%b\n' \
+				"$C_YELLOW" "$C_RESET" "$name" "$local_v" \
+				"$C_GREEN" "$remote_v" "$C_RESET" "$flags"
+			[ "$quiet" = 1 ] || printf '      %s%s/%s%s\n' "$C_BLUE" "$AUR_WEB" "$name" "$C_RESET"
+		elif [ "$quiet" = 0 ] && { [ "$verbose" = 1 ] || [ -n "$flags" ]; }; then
+			printf '  %s✓%s %-28s %-22s%b\n' \
+				"$C_GREEN" "$C_RESET" "$name" "$local_v" "$flags"
+		fi
+	done
+
+	if [ "$quiet" = 0 ]; then
+		echo
+		if [ "$updates" -gt 0 ]; then
+			printf '%s%d update(s) available.%s Run %s%s update%s for instructions.\n' \
+				"$C_BOLD" "$updates" "$C_RESET" "$C_BOLD" "$self" "$C_RESET"
+		else
+			printf '%sEverything is up to date.%s\n' "$C_GREEN" "$C_RESET"
+		fi
+	fi
+
+	[ "$updates" -gt 0 ] && return 2
+	return 0
+}
+
+# ------------------------------------------------------------- cmd: list -----
+cmd_list() { foreign_packages | awk '{print $1}'; }
+
+# ----------------------------------------------------------- cmd: update -----
+# Prints the guide for a single package. Never executes any of it.
+update_guide() {
+	local name="$1" local_v="$2" remote_v="$3" base="$4" ood="$5" maint="$6"
+	local dir="$BUILD_DIR/$base"
+
+	echo
+	printf '%s══ %s ══%s\n' "$C_BOLD" "$name" "$C_RESET"
+	if [ -n "$local_v" ] && [ -n "$remote_v" ]; then
+		printf '  installed %s%s%s → AUR %s%s%s\n' \
+			"$C_YELLOW" "$local_v" "$C_RESET" "$C_GREEN" "$remote_v" "$C_RESET"
+	elif [ -n "$remote_v" ]; then
+		printf '  AUR version %s%s%s (not installed)\n' "$C_GREEN" "$remote_v" "$C_RESET"
+	fi
+	[ "$base" != "$name" ] && \
+		printf '  %ssplit package — the git repo is the pkgbase: %s%s\n' "$C_DIM" "$base" "$C_RESET"
+	printf '  page  %s%s/%s%s\n' "$C_BLUE" "$AUR_WEB" "$name" "$C_RESET"
+
+	[ "$ood" != "0" ] && [ -n "$ood" ] && \
+		printf '  %s! flagged out-of-date in the AUR — the maintainer may not have pushed the fix yet%s\n' \
+			"$C_RED" "$C_RESET"
+	[ -z "$maint" ] && \
+		printf '  %s! orphaned (no maintainer) — read the PKGBUILD extra carefully%s\n' \
+			"$C_YELLOW" "$C_RESET"
+	case $name in
+		*-git|*-svn|*-hg|*-bzr)
+			printf '  %s! VCS package: it always builds the latest upstream commit, so the\n' "$C_MAGENTA"
+			printf '    AUR version number tells you little. Rebuild when you want it newer.%s\n' "$C_RESET" ;;
+	esac
+
+	if [ -d "$dir/.git" ]; then
+		step "1. Update the build files you already have"
+		cmd "cd $dir"
+		cmd "git fetch origin"
+		comment "# what changed since your last build:"
+		cmd "git log --oneline HEAD..origin/master"
+		cmd "git diff HEAD..origin/master"
+		comment "# only fast-forward, so a force-push can never rewrite your tree silently:"
+		cmd "git merge --ff-only origin/master"
+	else
+		step "1. Get the build files"
+		cmd "mkdir -p $BUILD_DIR"
+		cmd "git clone $AUR_GIT/$base.git $dir"
+		cmd "cd $dir"
+	fi
+
+	step "2. Review before you build  ← this is the whole point of doing it by hand"
+	cmd "less PKGBUILD"
+	cmd "ls -la; cat *.install 2>/dev/null"
+	comment "# a PKGBUILD is a shell script and *.install runs as root at install time."
+	comment "# check: source= URLs and their hosts, the sha256sums/b2sums, what"
+	comment "# build() and package() actually do, new depends=/makedepends=, and any"
+	comment "# curl|sh or downloads happening outside the source= array."
+	comment "# also skim the recent comments on the AUR page for build breakage."
+	comment "# verify only the sources, without building anything:"
+	cmd "makepkg --verifysource"
+
+	step "3. Build and install"
+	cmd "makepkg -si"
+	comment "# -s pulls missing build deps via pacman, then it hands the finished"
+	comment "# package to pacman -U. It asks for sudo only at those two points."
+	comment ""
+	comment "# or, to look at the package before it touches your system:"
+	cmd "makepkg -s"
+	cmd "pacman -Qlp *.pkg.tar.zst | less     # what files it would install"
+	cmd "sudo pacman -U *.pkg.tar.zst"
+	comment ""
+	comment "# if it stops on an unknown PGP key, import it explicitly after"
+	comment "# checking the key id in the PKGBUILD's validpgpkeys=:"
+	cmd "gpg --recv-keys <KEYID>"
+
+	step "4. Confirm and clean up"
+	cmd "pacman -Qi $name | head -n 3"
+	cmd "$self check"
+	comment "# drop the build products but keep the git checkout for next time:"
+	cmd "git clean -dfx"
+
+	case $name in
+		*-dkms)
+			step "Note for this DKMS package"
+			comment "# DKMS rebuilds the module against your installed kernel(s) at install"
+			comment "# time. Make sure the matching headers are present first, and reload"
+			comment "# the module or reboot afterwards — for a network driver, expect the"
+			comment "# link to drop when the module reloads."
+			cmd "pacman -Q linux linux-headers"
+			cmd "dkms status" ;;
+	esac
+	echo
+}
+
+cmd_update() {
+	local -a want=("$@")
+	local -a names=() versions=()
+	local n v
+	while read -r n v; do
+		[ -n "$n" ] || continue
+		names+=("$n"); versions+=("$v")
+	done < <(foreign_packages)
+
+	local -a targets=()
+	local remote
+
+	if [ ${#want[@]} -gt 0 ]; then
+		targets=("${want[@]}")
+		if ! remote=$(printf '%s\n' "${targets[@]}" | aur_info); then
+			die "could not query the AUR (no network?)"
+		fi
+	else
+		# No package given: every installed foreign package that has an update.
+		if [ ${#names[@]} -eq 0 ]; then
+			echo "No foreign packages installed."
+			return 0
+		fi
+		if ! remote=$(printf '%s\n' "${names[@]}" | aur_info); then
+			die "could not query the AUR (no network?)"
+		fi
+		local idx line rv
+		for idx in "${!names[@]}"; do
+			line=$(lookup "${names[$idx]}" "$remote")
+			[ -n "$line" ] || continue
+			rv=$(printf '%s' "$line" | cut -f2)
+			if [ "$(vercmp "${versions[$idx]}" "$rv")" -lt 0 ]; then
+				targets+=("${names[$idx]}")
+			fi
+		done
+		if [ ${#targets[@]} -eq 0 ]; then
+			printf '%sEverything is up to date — nothing to update.%s\n' "$C_GREEN" "$C_RESET"
+			return 0
+		fi
+		printf '%sManual update guide for %d package(s).%s ' \
+			"$C_BOLD" "${#targets[@]}" "$C_RESET"
+		printf '%sNothing below is executed for you.%s\n' "$C_DIM" "$C_RESET"
+	fi
+
+	local rc=0 t
+	for t in "${targets[@]}"; do
+		local line remote_v base ood maint local_v idx
+		line=$(lookup "$t" "$remote")
+		if [ -z "$line" ]; then
+			printf '%s: %s%s%s is not in the AUR — nothing to guide you through.\n' \
+				"$self" "$C_RED" "$t" "$C_RESET" >&2
+			rc=1
+			continue
+		fi
+		IFS=$'\t' read -r _ remote_v base ood maint <<<"$line"
+
+		local_v=""
+		for idx in "${!names[@]}"; do
+			[ "${names[$idx]}" = "$t" ] && { local_v="${versions[$idx]}"; break; }
+		done
+		[ -n "$local_v" ] || printf '%s: %s is not installed as a foreign package; showing the guide anyway.\n' \
+			"$self" "$t" >&2
+
+		update_guide "$t" "$local_v" "$remote_v" "$base" "$ood" "$maint"
+	done
+	return $rc
+}
+
+# ------------------------------------------------------------------ main -----
+main() {
+	local subcmd=""
+	local -a rest=()
+
+	while [ $# -gt 0 ]; do
+		case $1 in
+			-q|--quiet)    quiet=1 ;;
+			-v|--verbose)  verbose=1 ;;
+			--no-color)    use_color=0 ;;
+			-h|--help)     setup_colors; usage; exit 0 ;;
+			-V|--version)  echo "aurcheck $VERSION"; exit 0 ;;
+			-*)            die "unknown option: $1 (try --help)" ;;
+			check|update|list)
+				[ -z "$subcmd" ] || rest+=("$1")
+				[ -n "$subcmd" ] || subcmd=$1 ;;
+			*)             rest+=("$1") ;;
+		esac
+		shift
+	done
+
+	setup_colors
+
+	case "${subcmd:-check}" in
+		check)
+			[ ${#rest[@]} -eq 0 ] || die "check takes no arguments"
+			cmd_check ;;
+		list)
+			cmd_list ;;
+		update)
+			cmd_update ${rest[@]+"${rest[@]}"} ;;
+	esac
+}
+
+main "$@"
